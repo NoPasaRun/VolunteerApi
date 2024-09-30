@@ -16,7 +16,7 @@ from api.api import (
 
 api_routes = [
     path("volunteer/", VolunteerApi.as_view()),
-    path("link/", LinkApiView.as_view()),
+    path("link/<int:unit_id>/", LinkApiView.as_view()),
     path("task/", TaskApi.as_view()),
     path("comment/task/<int:task_id>/", CommentApi.as_view()),
     path("my/task/", MyTaskApi.as_view()),

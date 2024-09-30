@@ -1,12 +1,13 @@
-from rest_framework.permissions import IsAdminUser, IsAuthenticated
+from rest_framework.permissions import IsAdminUser, IsAuthenticated, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework import generics
 from rest_framework_simplejwt.views import TokenViewBase
 
-from api.models import Link, Task, Rating, Volunteer
+from api.models import Link, Task, Rating, Volunteer, Unit
 from api.permissions import VolunteerPermission
-from api.serializers import TaskSerializer, VUserLoginSerializer, VolunteerSerializer, CommentSerializer
+from api.serializers import TaskSerializer, VUserLoginSerializer, VolunteerSerializer, CommentSerializer, \
+    VolunteerReadSerializer, CommentReadSerializer
 
 
 class TokenObtainByLink(TokenViewBase):
@@ -22,8 +23,13 @@ class LinkApiView(APIView):
 
     permission_classes = (IsAdminUser,)
 
-    def post(self, request, *args, **kwargs):
-        (link := Link()).save()
+    def post(self, request, unit_id: int, *args, **kwargs):
+        unit = Unit.objects.filter(id=unit_id).first()
+        if not unit:
+            return Response({"detail": "Unit not found"}, 404)
+        if unit.creator != request.user:
+            return Response({"detail": "You don't have permission to invite users to this group"}, 403)
+        (link := Link(unit=unit)).save()
         return Response({"code": link.code}, 201)
 
 
@@ -34,19 +40,27 @@ class VolunteerApi(generics.ListAPIView):
         return sorted(Volunteer.objects.all(), key=lambda v: v.score)
 
 
-class MyApi(APIView):
+class MyApi(generics.CreateAPIView):
 
-    permission_classes = (VolunteerPermission,)
-    serializer_class = VolunteerSerializer
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [VolunteerPermission()]
+        return []
+
+    def get_serializer_class(self):
+        if self.request.method == 'GET':
+            return VolunteerReadSerializer
+        return VolunteerSerializer
 
     def get(self, request):
-        data = VolunteerSerializer(instance=request.volunteer).data
+        data = VolunteerSerializer(instance=request.user.volunteer).data
         return Response(data, 200)
 
     def post(self, request, *args, **kwargs):
         serializer = VolunteerSerializer(data=request.data)
         if serializer.is_valid():
-            return Response(serializer.validated_data, status=200)
+            serializer.save()
+            return Response(serializer.data, status=200)
         return Response(serializer.errors, status=400)
 
 
@@ -86,7 +100,7 @@ class ManageTaskApi(APIView):
 
     @proceed_task
     def post(self, request, task: Task, *args, **kwargs):
-        Rating(task=task, volunteer=request.volunteer).save()
+        Rating(task=task, volunteer=request.user.volunteer).save()
         return Response({"success": True}, 200)
 
     @proceed_task
@@ -97,12 +111,17 @@ class ManageTaskApi(APIView):
 
 class CommentApi(generics.CreateAPIView):
 
-    serializer_class = CommentSerializer
     permission_classes = (VolunteerPermission,)
+
+    def get_serializer_class(self):
+        if self.request.method == 'GET':
+            return CommentReadSerializer
+        return CommentSerializer
 
     @proceed_task
     def post(self, request, task: Task, *args, **kwargs):
-        serializer = CommentSerializer(data=request.data, task=task)
+        serializer = CommentSerializer(data=request.data)
         if serializer.is_valid():
-            return Response(serializer.validated_data, status=200)
+            serializer.save(task=task, volunteer=request.user.volunteer)
+            return Response(serializer.data, status=200)
         return Response(serializer.errors, status=400)

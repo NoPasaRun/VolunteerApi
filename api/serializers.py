@@ -1,17 +1,45 @@
+import base64
+import uuid
+
 from django.contrib.auth.models import update_last_login
-from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
+from django.db import IntegrityError
+from rest_framework.exceptions import APIException
 
 from rest_framework.serializers import (
     Serializer, UUIDField, ModelSerializer,
-    SerializerMethodField
+    SerializerMethodField, CharField, ImageField
 )
-from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework_simplejwt.settings import api_settings
 
 from api.models import Link, Task, VUser, Volunteer, Unit, Comment
 
 
+class Base64ImageField(ImageField):
+    def to_internal_value(self, data):
+        if isinstance(data, str) and data.startswith('data:image'):
+            format_, img_str = data.split(';base64,')
+            name, ext = str(uuid.uuid4().urn[9:]), format_.split('/')[-1]
+            data = ContentFile(base64.b64decode(img_str), name=name + '.' + ext)
+        return super(Base64ImageField, self).to_internal_value(data)
+
+
 class VUserSerializer(ModelSerializer):
+
+    username = CharField(required=True, write_only=True, max_length=50)
+
+    def save(self, password: str):
+        try:
+            if not self.is_valid():
+                return None
+            user = VUser(**self.validated_data)
+            user.set_password(password)
+            user.save()
+        except IntegrityError as e:
+            raise APIException({"detail": str(e)}, 400)
+        self.validated_data.pop("username")
+        return user
 
     class Meta:
         model = VUser
@@ -34,44 +62,58 @@ class UnitSerializer(ModelSerializer):
         )
 
 
-class VolunteerSerializer(ModelSerializer):
-
+class VolunteerReadSerializer(ModelSerializer):
     unit = UnitSerializer(source="link.unit", read_only=True)
-    code = UUIDField(required=True)
-    user = VUserSerializer()
-
-    def validate(self, attrs):
-        link = Link.objects.filter(code=attrs.pop("code")).first()
-        if not link or not link.is_open:
-            raise ValidationError({"code": "Not found or locked"})
-        attrs["link"] = link
+    user = VUserSerializer(read_only=True)
 
     class Meta:
         model = Volunteer
-        read_only_fields = ('unit', "score")
         write_only_fields = ('code',)
         fields = (
             "unit",
             "user",
-            "score",
             "avatar",
-            "code"
         )
 
 
-class CommentSerializer(ModelSerializer):
+class VolunteerSerializer(ModelSerializer):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if not (task := kwargs.get("task")):
-            raise ValidationError("Task is required")
-        self.data["task"] = task
-        self.data["volunteer"] = self.context["request"].volunteer
+    code = UUIDField(required=True, write_only=True)
+    user = VUserSerializer()
+    avatar = Base64ImageField(required=False)
+
+    def create(self, validated_data):
+        code = self.validated_data.pop("code")
+        link = Link.objects.filter(code=code).first()
+        if not link or not link.is_open:
+            raise APIException({"code": "Not found or locked"}, 404)
+
+        user_serializer = VUserSerializer(data=self.validated_data.pop("user"))
+        user = user_serializer.save(password=str(code))
+
+        try:
+            volunteer = Volunteer(**self.validated_data, user=user)
+            volunteer.link, volunteer.user = link, user
+            volunteer.save()
+        except IntegrityError as e:
+            user.delete()
+            raise APIException({"detail": str(e)}, 400)
+        self.validated_data["user"] = user_serializer.validated_data
+        return volunteer
+
+    @property
+    def data(self):
+        volunteer_serializer = VolunteerReadSerializer(instance=self.instance)
+        return volunteer_serializer.data
 
     class Meta:
-        model = Comment
-        read_only_fields = ("task", "volunteer")
-        fields = "__all__"
+        model = Volunteer
+        write_only_fields = ('code',)
+        fields = (
+            "user",
+            "avatar",
+            "code",
+        )
 
 
 class TaskSerializer(ModelSerializer):
@@ -88,6 +130,7 @@ class TaskSerializer(ModelSerializer):
 
     class Meta:
         model = Task
+        read_only_fields = ('creator', 'photo',)
         fields = (
             "title",
             "description",
@@ -100,6 +143,38 @@ class TaskSerializer(ModelSerializer):
         )
 
 
+class CommentReadSerializer(ModelSerializer):
+
+    volunteer = VolunteerReadSerializer(read_only=True)
+    task = TaskSerializer(read_only=True)
+
+    class Meta:
+        model = Comment
+        fields = ("text", "photo", "volunteer", "task")
+
+
+class CommentSerializer(ModelSerializer):
+
+    photo = Base64ImageField(required=False, write_only=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    @property
+    def data(self):
+        comment_serializer = CommentReadSerializer(instance=self.instance)
+        return comment_serializer.data
+
+    def save(self, task: Task, volunteer: Volunteer):
+        obj = Comment(**self.validated_data)
+        obj.task, obj.volunteer = task, volunteer
+        obj.save()
+
+    class Meta:
+        model = Comment
+        fields = ("text", "photo",)
+
+
 class VUserLoginSerializer(Serializer):
 
     code = UUIDField(required=True)
@@ -107,13 +182,14 @@ class VUserLoginSerializer(Serializer):
     def validate(self, attrs):
         link = Link.objects.filter(code=attrs.get('code')).first()
         if not link or not hasattr(link, 'volunteer'):
-            raise ValidationError(message="Code is invalid")
+            raise APIException({"message": "Code is invalid"}, 400)
         user = link.volunteer.user
 
-        refresh = RefreshToken.for_user(user)
+        token = AccessToken.for_user(user)
         if api_settings.UPDATE_LAST_LOGIN:
             update_last_login(None, user)
+        print(token.payload)
 
         return {
-            "access": str(refresh.access_token)
+            "access": str(token)
         }
